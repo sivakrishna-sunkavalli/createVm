@@ -2,9 +2,9 @@ name: Oracle Always Free VM Provisioner
 
 on:
   schedule:
-    # Set to 1 minute, but note that GitHub will throttle this to a 5-minute minimum interval
+    # Configured for 1 minute, though GitHub throttles this execution to a 5-minute minimum
     - cron: '* * * * *'
-  workflow_dispatch: # Allows you to manually trigger it
+  workflow_dispatch: # Allows manual triggers
 
 jobs:
   launch-instance:
@@ -38,7 +38,7 @@ jobs:
         echo "Creating SSH key file..."
         echo "$SSH_KEY" > instance_key.pub
         
-        # Reduced to 2 cycles (60 seconds total) to prevent overlapping runs if GitHub throttles the cron
+        # Runs 2 loop cycles (30s sleep gap) to stay safe within potential cron overlaps
         for i in {1..2}; do
           echo "=== Check Cycle $i ==="
 
@@ -63,13 +63,14 @@ jobs:
             AD=$(echo "$AD" | xargs)
             echo "Attempting VM creation in Domain: $AD"
 
+            # Fixed JSON payload escaping structure to resolve the 400 CannotParseRequest error
             oci compute instance launch \
               --compartment-id "$COMPARTMENT" \
               --subnet-id "$SUBNET" \
               --image-id "$IMAGE" \
               --availability-domain "$AD" \
               --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus": 1, "memory-in-gbs": 2}' \
+              --shape-config '{"ocpus":1.0,"memoryInGBs":2.0}' \
               --ssh-authorized-keys-file "instance_key.pub" \
               --wait-for-state RUNNING
 
@@ -78,7 +79,7 @@ jobs:
               SUCCESS=true
               break 2 
             else
-              echo "Capacity error in $AD."
+              echo "Capacity or request error in $AD."
             fi
           done
           
