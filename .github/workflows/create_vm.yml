@@ -2,9 +2,9 @@ name: Oracle Always Free VM Provisioner
 
 on:
   schedule:
-    # Runs automatically every 10 minutes
-    - cron: '*/10 * * * *'
-  workflow_dispatch: # Allows manual trigger anytime
+    # Runs the workflow container every 1 minutes (GitHub's fastest limit)
+    - cron: '*/1 * * * *'
+  workflow_dispatch: # Allows you to manually trigger it
 
 jobs:
   launch-instance:
@@ -26,9 +26,9 @@ jobs:
         key_file=~/.oci/oci_api_key.pem
         EOF
         
-        bash -c "$(curl -L https://githubusercontent.com)" -- --accept-all-defaults
-        echo "/home/runner/bin" >> $GITHUB_PATH
-
+        # Install the OCI CLI tool
+        bash -c "$(curl -L https://githubusercontent.com || curl -L https://githubusercontent.com)" -- --accept-all-defaults
+        
     - name: Discover Domains & Attempt VM Creation
       env:
         COMPARTMENT: ${{ vars.OCI_COMPARTMENT_ID }}
@@ -36,52 +36,61 @@ jobs:
         IMAGE: ${{ vars.OCI_IMAGE_ID }}
         SSH_KEY: ${{ vars.SSH_PUBLIC_KEY }}
       run: |
+        # Explicitly map the oci installation location so it never returns command not found
+        export PATH=$PATH:/home/runner/bin
+        
         echo "Creating SSH key file..."
         echo "$SSH_KEY" > instance_key.pub
         
-        echo "Checking if an Ampere VM already exists..."
-        EXISTING_VMS=$(oci compute instance list --compartment-id "$COMPARTMENT" --query "data[?shape=='VM.Standard.A1.Flex' && 'lifecycle-state'!='TERMINATED'].id" --output json)
-        if [ "$EXISTING_VMS" != "[]" ] && [ ! -z "$EXISTING_VMS" ]; then
-          echo "SUCCESS: An Always Free Ampere VM already exists in this compartment. Stopping script to prevent duplicates."
-          exit 0
-        fi
+        # Outer execution loop: Spans across roughly 4.5 minutes to hit a 30-second checking interval
+        for i in {1..9}; do
+          echo "=== Check Cycle $i ==="
 
-        echo "Fetching all Availability Domains for the region..."
-        AD_LIST=$(oci iam availability-domain list --compartment-id "$COMPARTMENT" --query "data[*].name" --output table | grep -v -E '\-\-\-|Name')
-        
-        if [ -z "$AD_LIST" ]; then
-          echo "ERROR: Could not fetch availability domains. Check OCI credentials."
-          exit 1
-        fi
-
-        SUCCESS=false
-
-        for AD in $AD_LIST; do
-          AD=$(echo "$AD" | xargs)
-          echo "--------------------------------------------------------"
-          echo "Attempting VM creation in Availability Domain: $AD"
-          echo "--------------------------------------------------------"
-
-          oci compute instance launch \
-            --compartment-id "$COMPARTMENT" \
-            --subnet-id "$SUBNET" \
-            --image-id "$IMAGE" \
-            --availability-domain "$AD" \
-            --shape "VM.Standard.A1.Flex" \
-            --shape-config '{"ocpus": 1, "memory-in-gbs": 2}' \
-            --ssh-authorized-keys-file "instance_key.pub" \
-            --wait-for-state RUNNING
-
-          if [ $? -eq 0 ]; then
-            echo "SUCCESS: Instance successfully created in $AD!"
-            SUCCESS=true
-            break
-          else
-            echo "Failed or Out of Capacity in $AD. Checking next domain..."
+          echo "Checking if an Ampere VM already exists..."
+          EXISTING_VMS=$(oci compute instance list --compartment-id "$COMPARTMENT" --query "data[?shape=='VM.Standard.A1.Flex' && 'lifecycle-state'!='TERMINATED'].id" --output json)
+          if [ "$EXISTING_VMS" != "[]" ] && [ ! -z "$EXISTING_VMS" ]; then
+            echo "SUCCESS: An Always Free Ampere VM already exists. Terminating loop workflow."
+            exit 0
           fi
+
+          echo "Fetching all Availability Domains for the region..."
+          AD_LIST=$(oci iam availability-domain list --compartment-id "$COMPARTMENT" --query "data[*].name" --output table | grep -v -E '\-\-\-|Name')
+          
+          if [ -z "$AD_LIST" ]; then
+            echo "ERROR: Could not fetch availability domains. Check OCI credentials."
+            exit 1
+          fi
+
+          SUCCESS=false
+
+          for AD in $AD_LIST; do
+            AD=$(echo "$AD" | xargs)
+            echo "Attempting VM creation in Domain: $AD"
+
+            oci compute instance launch \
+              --compartment-id "$COMPARTMENT" \
+              --subnet-id "$SUBNET" \
+              --image-id "$IMAGE" \
+              --availability-domain "$AD" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus": 1, "memory-in-gbs": 2}' \
+              --ssh-authorized-keys-file "instance_key.pub" \
+              --wait-for-state RUNNING
+
+            if [ $? -eq 0 ]; then
+              echo "SUCCESS: Instance successfully created in $AD!"
+              SUCCESS=true
+              break 2 # Break both the AD loop and the 30-second interval loops
+            else
+              echo "Capacity error in $AD."
+            fi
+          done
+          
+          echo "Waiting 30 seconds before next scan..."
+          sleep 30
         done
 
         if [ "$SUCCESS" = false ]; then
-          echo "All Availability Domains in this region are currently out of capacity."
+          echo "All structural availability domains are out of stock for this run window."
           exit 1
         fi
