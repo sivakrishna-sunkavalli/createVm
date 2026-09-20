@@ -4,7 +4,7 @@ on:
   schedule:
     # Runs the workflow container every 5 minutes (GitHub's fastest limit)
     - cron: '*/5 * * * *'
-  workflow_dispatch: # Allows you to manually trigger it
+  workflow_dispatch: # This explicitly makes it show up under the Actions tab for manual runs
 
 jobs:
   launch-instance:
@@ -17,7 +17,7 @@ jobs:
         echo "${{ secrets.OCI_KEY_FILE }}" > ~/.oci/oci_api_key.pem
         chmod 600 ~/.oci/oci_api_key.pem
         
-        cat <<EOF > ~/.oci/config
+        cat << 'EOF' > ~/.oci/config
         [DEFAULT]
         user=${{ secrets.OCI_USER_ID }}
         fingerprint=${{ secrets.OCI_FINGERPRINT }}
@@ -26,11 +26,9 @@ jobs:
         key_file=~/.oci/oci_api_key.pem
         EOF
         
-        # Explicitly restrict file permissions to silence environment warnings
         chmod 600 ~/.oci/config
-        
         pip install oci-cli
-        
+
     - name: Discover Domains & Attempt VM Creation
       env:
         COMPARTMENT: ${{ vars.OCI_COMPARTMENT_ID }}
@@ -67,8 +65,8 @@ jobs:
             AD=$(echo "$AD" | xargs)
             echo "Attempting VM creation in Domain: $AD"
 
-            # Generate a strict, error-proof raw JSON request template file
-            cat <<EOF > launch_request.json
+            # Create a clean, error-proof raw JSON request template file
+            cat << EOF > launch_request.json
             {
               "compartmentId": "$COMPARTMENT",
               "subnetId": "$SUBNET",
@@ -80,7 +78,7 @@ jobs:
                 "memoryInGBs": 2
               }
             }
-EOF
+        EOF
 
             # Launch using the declarative file payload scheme to bypass shell parsing bugs
             oci compute instance launch \
