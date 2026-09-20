@@ -4,7 +4,7 @@ on:
   schedule:
     # Triggers the workflow run container every 5 minutes (GitHub's fastest limit)
     - cron: '*/5 * * * *'
-  workflow_dispatch: # Allows manual triggers via the Actions tab
+  workflow_dispatch: # Forces the workflow to show up in the Actions tab for manual runs
 
 jobs:
   launch-instance:
@@ -40,10 +40,13 @@ jobs:
         SUPPRESS_LABEL_WARNING: "True"
         OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
       run: |
+        # CRITICAL FIX: Turn off GitHub's automatic "fail-fast" behavior
+        set +e
+        
         echo "Creating SSH key file..."
         echo "$SSH_KEY" > instance_key.pub
         
-        # Bypassing the 5-min cron limit: Runs 5 cycles spaced 60 seconds apart (5 minutes total)
+        # Runs 5 internal cycles spaced 60 seconds apart (Bypasses 5-min cron limit)
         for i in {1..5}; do
           echo "=== Check Cycle $i ==="
 
@@ -54,7 +57,7 @@ jobs:
             exit 0
           fi
 
-          echo "Fetching all Availability Domains for the region..."
+          echo "Fetching all Availability Domains for Chicago..."
           AD_JSON=$(oci iam availability-domain list --compartment-id "$COMPARTMENT" --query "data[].name" --output json)
           
           if [ -z "$AD_JSON" ] || [ "$AD_JSON" = "[]" ]; then
@@ -64,7 +67,9 @@ jobs:
 
           SUCCESS=false
 
+          # Safely loop across AD-1, AD-2, and AD-3
           for AD in $(echo "$AD_JSON" | jq -r '.[]'); do
+            AD=$(echo "$AD" | xargs)
             echo "Attempting VM creation in Domain: $AD"
 
             oci compute instance launch \
@@ -79,11 +84,11 @@ jobs:
               --ssh-authorized-keys-file instance_key.pub \
               --wait-for-state RUNNING
 
+            # Because set +e is active, this check will now run even if the command above returns a 500 error
             if [ $? -eq 0 ]; then
               echo "SUCCESS: Instance successfully created in $AD!"
               SUCCESS=true
               
-              # Send a Telegram alert directly to your phone
               MESSAGE="🎉 SUCCESS! Your Oracle Always Free VM has been successfully created in domain $AD! 🚀"
               curl -s -X POST "https://telegram.org{TG_TOKEN}/sendMessage" \
                 -d "chat_id=${TG_CHAT}" \
@@ -91,12 +96,11 @@ jobs:
                 
               break 2 
             else
-              echo "Capacity error or request rejected in $AD."
+              echo "Capacity error or request rejected in $AD. Moving to next domain..."
             fi
           done
           
-          # Wait exactly 60 seconds before executing the next internal check cycle
-          echo "Waiting 60 seconds before next scan..."
+          echo "Waiting 60 seconds before next scan loop..."
           sleep 60
         done
 
