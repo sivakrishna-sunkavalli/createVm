@@ -2,9 +2,9 @@ name: Oracle Always Free VM Provisioner
 
 on:
   schedule:
-    # Runs the workflow container every 5 minutes (GitHub's fastest limit)
+    # Triggers the workflow run container every 5 minutes (GitHub's fastest limit)
     - cron: '*/5 * * * *'
-  workflow_dispatch: # Forces the workflow to show up in the Actions tab for manual runs
+  workflow_dispatch: # Allows manual triggers via the Actions tab
 
 jobs:
   launch-instance:
@@ -35,13 +35,16 @@ jobs:
         SUBNET: ${{ vars.OCI_SUBNET_ID }}
         IMAGE: ${{ vars.OCI_IMAGE_ID }}
         SSH_KEY: ${{ vars.SSH_PUBLIC_KEY }}
+        TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         SUPPRESS_LABEL_WARNING: "True"
         OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
       run: |
         echo "Creating SSH key file..."
         echo "$SSH_KEY" > instance_key.pub
         
-        for i in {1..2}; do
+        # Bypassing the 5-min cron limit: Runs 5 cycles spaced 60 seconds apart (5 minutes total)
+        for i in {1..5}; do
           echo "=== Check Cycle $i ==="
 
           echo "Checking if an Ampere VM already exists..."
@@ -52,7 +55,6 @@ jobs:
           fi
 
           echo "Fetching all Availability Domains for the region..."
-          # Fix: Pulls names strictly via raw JSON instead of table lines to eliminate character parsing leaks
           AD_JSON=$(oci iam availability-domain list --compartment-id "$COMPARTMENT" --query "data[].name" --output json)
           
           if [ -z "$AD_JSON" ] || [ "$AD_JSON" = "[]" ]; then
@@ -62,11 +64,9 @@ jobs:
 
           SUCCESS=false
 
-          # Safe loop mapping directly across the structured JSON keys
           for AD in $(echo "$AD_JSON" | jq -r '.[]'); do
             echo "Attempting VM creation in Domain: $AD"
 
-            # Launching with direct native payload quoting format
             oci compute instance launch \
               --availability-domain "$AD" \
               --compartment-id "$COMPARTMENT" \
@@ -82,17 +82,25 @@ jobs:
             if [ $? -eq 0 ]; then
               echo "SUCCESS: Instance successfully created in $AD!"
               SUCCESS=true
+              
+              # Send a Telegram alert directly to your phone
+              MESSAGE="🎉 SUCCESS! Your Oracle Always Free VM has been successfully created in domain $AD! 🚀"
+              curl -s -X POST "https://telegram.org{TG_TOKEN}/sendMessage" \
+                -d "chat_id=${TG_CHAT}" \
+                -d "text=${MESSAGE}"
+                
               break 2 
             else
               echo "Capacity error or request rejected in $AD."
             fi
           done
           
-          echo "Waiting 30 seconds before next scan..."
-          sleep 30
+          # Wait exactly 60 seconds before executing the next internal check cycle
+          echo "Waiting 60 seconds before next scan..."
+          sleep 60
         done
 
         if [ "$SUCCESS" = false ]; then
-          echo "All availability domains are currently out of stock for this run window."
-          exit 1
+          echo "All availability domains are currently out of stock for this 5-minute block window."
+          exit 0
         fi
