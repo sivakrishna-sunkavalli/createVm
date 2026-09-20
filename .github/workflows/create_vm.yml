@@ -52,40 +52,30 @@ jobs:
           fi
 
           echo "Fetching all Availability Domains for the region..."
-          AD_LIST=$(oci iam availability-domain list --compartment-id "$COMPARTMENT" --query "data[*].name" --output table | grep -v -E '\-\-\-|Name')
+          # Fix: Pulls names strictly via raw JSON instead of table lines to eliminate character parsing leaks
+          AD_JSON=$(oci iam availability-domain list --compartment-id "$COMPARTMENT" --query "data[].name" --output json)
           
-          if [ -z "$AD_LIST" ]; then
+          if [ -z "$AD_JSON" ] || [ "$AD_JSON" = "[]" ]; then
             echo "ERROR: Could not fetch availability domains. Check OCI credentials."
             exit 1
           fi
 
           SUCCESS=false
 
-          for AD in $AD_LIST; do
-            AD=$(echo "$AD" | xargs)
+          # Safe loop mapping directly across the structured JSON keys
+          for AD in $(echo "$AD_JSON" | jq -r '.[]'); do
             echo "Attempting VM creation in Domain: $AD"
 
-            # Use jq to programmatically construct an error-proof JSON payload
-            jq -n \
-              --arg comp "$COMPARTMENT" \
-              --arg sub "$SUBNET" \
-              --arg img "$IMAGE" \
-              --arg ad "$AD" \
-              '{
-                compartmentId: $comp,
-                subnetId: $sub,
-                imageId: $img,
-                availabilityDomain: $ad,
-                shape: "VM.Standard.A1.Flex",
-                shapeConfig: {
-                  ocpus: 1,
-                  memoryInGBs: 2
-                }
-              }' > launch_request.json
-
-            # Launch using the declarative file payload scheme
+            # Launching with direct native payload quoting format
             oci compute instance launch \
-              --from-json file://launch_request.json \
+              --availability-domain "$AD" \
+              --compartment-id "$COMPARTMENT" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":1,"memoryInGBs":2}' \
+              --subnet-id "$SUBNET" \
+              --image-id "$IMAGE" \
+              --assign-public-ip true \
+              --display-name "AlwaysFree-ARM-Server" \
               --ssh-authorized-keys-file instance_key.pub \
               --wait-for-state RUNNING
 
