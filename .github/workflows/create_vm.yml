@@ -4,7 +4,7 @@ on:
   schedule:
     # Runs the workflow container every 5 minutes (GitHub's fastest limit)
     - cron: '*/5 * * * *'
-  workflow_dispatch: # This explicitly makes it show up under the Actions tab for manual runs
+  workflow_dispatch: # This forces the script to show up in the Actions tab for manual runs
 
 jobs:
   launch-instance:
@@ -65,24 +65,20 @@ jobs:
             AD=$(echo "$AD" | xargs)
             echo "Attempting VM creation in Domain: $AD"
 
-            # Create a clean, error-proof raw JSON request template file
-            cat << EOF > launch_request.json
-            {
-              "compartmentId": "$COMPARTMENT",
-              "subnetId": "$SUBNET",
-              "imageId": "$IMAGE",
-              "availabilityDomain": "$AD",
-              "shape": "VM.Standard.A1.Flex",
-              "shapeConfig": {
-                "ocpus": 1,
-                "memoryInGBs": 2
-              }
-            }
-        EOF
+            # Create a completely flat, indentation-free JSON file to stop the 400 parsing errors
+            cat << 'EOF' > launch_request.json
+{"compartmentId":"$COMPARTMENT","subnetId":"$SUBNET","imageId":"$IMAGE","availabilityDomain":"$AD","shape":"VM.Standard.A1.Flex","shapeConfig":{"ocpus":1,"memoryInGBs":2}}
+EOF
 
-            # Launch using the declarative file payload scheme to bypass shell parsing bugs
+            # Substitute environment variables cleanly into the flat JSON file layout
+            sed -i "s|\$COMPARTMENT|$COMPARTMENT|g" launch_request.json
+            sed -i "s|\$SUBNET|$SUBNET|g" launch_request.json
+            sed -i "s|\$IMAGE|$IMAGE|g" launch_request.json
+            sed -i "s|\$AD|$AD|g" launch_request.json
+
+            # Launch using the declarative file payload scheme
             oci compute instance launch \
-              --from-json file://launch_request.json \
+              --from-json "file://launch_request.json" \
               --ssh-authorized-keys-file "instance_key.pub" \
               --wait-for-state RUNNING
 
