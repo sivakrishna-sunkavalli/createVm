@@ -40,13 +40,12 @@ jobs:
         SUPPRESS_LABEL_WARNING: "True"
         OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
       run: |
-        # CRITICAL FIX: Turn off GitHub's automatic "fail-fast" behavior
         set +e
         
         echo "Creating SSH key file..."
         echo "$SSH_KEY" > instance_key.pub
         
-        # Runs 5 internal cycles spaced 60 seconds apart (Bypasses 5-min cron limit)
+        # Increased to 5 check cycles to maintain a perfect automated cadence
         for i in {1..5}; do
           echo "=== Check Cycle $i ==="
 
@@ -67,11 +66,11 @@ jobs:
 
           SUCCESS=false
 
-          # Safely loop across AD-1, AD-2, and AD-3
           for AD in $(echo "$AD_JSON" | jq -r '.[]'); do
             AD=$(echo "$AD" | xargs)
-            echo "Attempting VM creation in Domain: $AD"
+            echo "Attempting immediate VM creation in Domain: $AD"
 
+            # REMOVED --wait-for-state RUNNING to allow instantaneous out-of-capacity checking
             oci compute instance launch \
               --availability-domain "$AD" \
               --compartment-id "$COMPARTMENT" \
@@ -81,26 +80,24 @@ jobs:
               --image-id "$IMAGE" \
               --assign-public-ip true \
               --display-name "AlwaysFree-ARM-Server" \
-              --ssh-authorized-keys-file instance_key.pub \
-              --wait-for-state RUNNING
+              --ssh-authorized-keys-file instance_key.pub
 
-            # Because set +e is active, this check will now run even if the command above returns a 500 error
             if [ $? -eq 0 ]; then
-              echo "SUCCESS: Instance successfully created in $AD!"
+              echo "SUCCESS: Instance initialization request accepted in $AD!"
               SUCCESS=true
               
-              MESSAGE="🎉 SUCCESS! Your Oracle Always Free VM has been successfully created in domain $AD! 🚀"
+              MESSAGE="🎉 SUCCESS! Your Oracle Always Free VM request was accepted in domain $AD! It is now provisioning. 🚀"
               curl -s -X POST "https://telegram.org{TG_TOKEN}/sendMessage" \
                 -d "chat_id=${TG_CHAT}" \
                 -d "text=${MESSAGE}"
                 
               break 2 
             else
-              echo "Capacity error or request rejected in $AD. Moving to next domain..."
+              echo "Capacity error in $AD. Moving to next domain immediately..."
             fi
           done
           
-          echo "Waiting 60 seconds before next scan loop..."
+          echo "Checked all domains. Waiting exactly 60 seconds before next scan loop..."
           sleep 60
         done
 
