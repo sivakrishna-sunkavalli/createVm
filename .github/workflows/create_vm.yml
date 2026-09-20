@@ -2,7 +2,7 @@ name: Oracle Always Free VM Provisioner
 
 on:
   schedule:
-    # Configured for 1 minute, though GitHub throttles this execution to a 5-minute minimum
+    # Set to 1 minute (GitHub will automatically scale this to a 5-minute interval)
     - cron: '* * * * *'
   workflow_dispatch: # Allows manual triggers
 
@@ -26,6 +26,9 @@ jobs:
         key_file=~/.oci/oci_api_key.pem
         EOF
         
+        # Enforce correct file permissions to hide CLI warnings
+        chmod 600 ~/.oci/config
+        
         pip install oci-cli
         
     - name: Discover Domains & Attempt VM Creation
@@ -34,11 +37,16 @@ jobs:
         SUBNET: ${{ vars.OCI_SUBNET_ID }}
         IMAGE: ${{ vars.OCI_IMAGE_ID }}
         SSH_KEY: ${{ vars.SSH_PUBLIC_KEY }}
+        # Suppress security and label warnings in GitHub Actions logs
+        SUPPRESS_LABEL_WARNING: "True"
+        OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
       run: |
         echo "Creating SSH key file..."
         echo "$SSH_KEY" > instance_key.pub
         
-        # Runs 2 loop cycles (30s sleep gap) to stay safe within potential cron overlaps
+        # Defines the JSON natively as an environment variable to prevent quote-stripping issues
+        SHAPE_JSON='{"ocpus":1,"memoryInGBs":2}'
+        
         for i in {1..2}; do
           echo "=== Check Cycle $i ==="
 
@@ -63,14 +71,14 @@ jobs:
             AD=$(echo "$AD" | xargs)
             echo "Attempting VM creation in Domain: $AD"
 
-            # Fixed JSON payload escaping structure to resolve the 400 CannotParseRequest error
+            # Uses the SHAPE_JSON variable natively wrapped in clean single quotes
             oci compute instance launch \
               --compartment-id "$COMPARTMENT" \
               --subnet-id "$SUBNET" \
               --image-id "$IMAGE" \
               --availability-domain "$AD" \
               --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus":1.0,"memoryInGBs":2.0}' \
+              --shape-config "$SHAPE_JSON" \
               --ssh-authorized-keys-file "instance_key.pub" \
               --wait-for-state RUNNING
 
