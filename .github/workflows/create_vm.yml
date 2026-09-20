@@ -2,8 +2,8 @@ name: Oracle Always Free VM Provisioner
 
 on:
   schedule:
-    # Runs the workflow container every 1 minutes (GitHub's fastest limit)
-    - cron: '*/1 * * * *'
+    # Set to 1 minute, but note that GitHub will throttle this to a 5-minute minimum interval
+    - cron: '* * * * *'
   workflow_dispatch: # Allows you to manually trigger it
 
 jobs:
@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Set up OCI CLI
+    - name: Set up OCI CLI via Pip
       run: |
         mkdir -p ~/.oci
         echo "${{ secrets.OCI_KEY_FILE }}" > ~/.oci/oci_api_key.pem
@@ -26,8 +26,7 @@ jobs:
         key_file=~/.oci/oci_api_key.pem
         EOF
         
-        # Install the OCI CLI tool
-        bash -c "$(curl -L https://githubusercontent.com || curl -L https://githubusercontent.com)" -- --accept-all-defaults
+        pip install oci-cli
         
     - name: Discover Domains & Attempt VM Creation
       env:
@@ -36,20 +35,17 @@ jobs:
         IMAGE: ${{ vars.OCI_IMAGE_ID }}
         SSH_KEY: ${{ vars.SSH_PUBLIC_KEY }}
       run: |
-        # Explicitly map the oci installation location so it never returns command not found
-        export PATH=$PATH:/home/runner/bin
-        
         echo "Creating SSH key file..."
         echo "$SSH_KEY" > instance_key.pub
         
-        # Outer execution loop: Spans across roughly 4.5 minutes to hit a 30-second checking interval
-        for i in {1..9}; do
+        # Reduced to 2 cycles (60 seconds total) to prevent overlapping runs if GitHub throttles the cron
+        for i in {1..2}; do
           echo "=== Check Cycle $i ==="
 
           echo "Checking if an Ampere VM already exists..."
           EXISTING_VMS=$(oci compute instance list --compartment-id "$COMPARTMENT" --query "data[?shape=='VM.Standard.A1.Flex' && 'lifecycle-state'!='TERMINATED'].id" --output json)
           if [ "$EXISTING_VMS" != "[]" ] && [ ! -z "$EXISTING_VMS" ]; then
-            echo "SUCCESS: An Always Free Ampere VM already exists. Terminating loop workflow."
+            echo "SUCCESS: An Always Free Ampere VM already exists. Terminating workflow."
             exit 0
           fi
 
@@ -80,7 +76,7 @@ jobs:
             if [ $? -eq 0 ]; then
               echo "SUCCESS: Instance successfully created in $AD!"
               SUCCESS=true
-              break 2 # Break both the AD loop and the 30-second interval loops
+              break 2 
             else
               echo "Capacity error in $AD."
             fi
@@ -91,6 +87,6 @@ jobs:
         done
 
         if [ "$SUCCESS" = false ]; then
-          echo "All structural availability domains are out of stock for this run window."
+          echo "All availability domains are currently out of stock for this run window."
           exit 1
         fi
