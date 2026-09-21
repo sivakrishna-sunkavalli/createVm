@@ -1,76 +1,217 @@
 name: Oracle Always Free VM Provisioner
 
 on:
+  # GitHub's scheduler cannot reliably run every minute.
+  # This starts a new runner periodically, while the script itself
+  # performs the actual checks every 60 seconds.
   schedule:
-    # Triggers the workflow run container every 5 minutes (GitHub's fastest limit)
     - cron: '*/5 * * * *'
-  workflow_dispatch: # Forces the workflow to show up in the Actions tab for manual runs
+
+  workflow_dispatch:
+
+# Prevent multiple copies from running simultaneously.
+concurrency:
+  group: oracle-a1-provisioner
+  cancel-in-progress: false
 
 jobs:
   launch-instance:
     runs-on: ubuntu-latest
 
+    # Prevent this job from running indefinitely.
+    # 350 minutes is below GitHub-hosted job limits.
+    timeout-minutes: 350
+
     steps:
-    - name: Set up OCI CLI via Pip
-      run: |
-        mkdir -p ~/.oci
-        echo "${{ secrets.OCI_KEY_FILE }}" > ~/.oci/oci_api_key.pem
-        chmod 600 ~/.oci/oci_api_key.pem
-        
-        cat << 'EOF' > ~/.oci/config
-        [DEFAULT]
-        user=${{ secrets.OCI_USER_ID }}
-        fingerprint=${{ secrets.OCI_FINGERPRINT }}
-        tenancy=${{ secrets.OCI_TENANCY_ID }}
-        region=us-chicago-1
-        key_file=~/.oci/oci_api_key.pem
-        EOF
-        
-        chmod 600 ~/.oci/config
-        pip install oci-cli
 
-    - name: Discover Domains & Attempt VM Creation
-      env:
-        COMPARTMENT: ${{ vars.OCI_COMPARTMENT_ID }}
-        SUBNET: ${{ vars.OCI_SUBNET_ID }}
-        IMAGE: ${{ vars.OCI_IMAGE_ID }}
-        SSH_KEY: ${{ vars.SSH_PUBLIC_KEY }}
-        TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
-        SUPPRESS_LABEL_WARNING: "True"
-        OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
-      run: |
-        set +e
-        
-        echo "Creating SSH key file..."
-        echo "$SSH_KEY" > instance_key.pub
-        
-        # Increased to 5 check cycles to maintain a perfect automated cadence
-        for i in {1..5}; do
-          echo "=== Check Cycle $i ==="
+      # ------------------------------------------------------------
+      # OCI CLI
+      # ------------------------------------------------------------
+      - name: Install and configure OCI CLI
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          echo "Checking if an Ampere VM already exists..."
-          EXISTING_VMS=$(oci compute instance list --compartment-id "$COMPARTMENT" --query "data[?shape=='VM.Standard.A1.Flex' && 'lifecycle-state'!='TERMINATED'].id" --output json)
-          if [ "$EXISTING_VMS" != "[]" ] && [ ! -z "$EXISTING_VMS" ]; then
-            echo "SUCCESS: An Always Free Ampere VM already exists. Terminating workflow."
-            exit 0
-          fi
+          echo "Creating OCI configuration directory..."
+          mkdir -p ~/.oci
 
-          echo "Fetching all Availability Domains for Chicago..."
-          AD_JSON=$(oci iam availability-domain list --compartment-id "$COMPARTMENT" --query "data[].name" --output json)
-          
-          if [ -z "$AD_JSON" ] || [ "$AD_JSON" = "[]" ]; then
-            echo "ERROR: Could not fetch availability domains. Check OCI credentials."
-            exit 1
-          fi
+          echo "Writing OCI private key..."
+          printf '%s\n' '${{ secrets.OCI_KEY_FILE }}' > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
 
-          SUCCESS=false
+          echo "Writing OCI config..."
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_ID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_ID }}
+          region=us-chicago-1
+          key_file=~/.oci/oci_api_key.pem
+          EOF
 
-          for AD in $(echo "$AD_JSON" | jq -r '.[]'); do
-            AD=$(echo "$AD" | xargs)
-            echo "Attempting immediate VM creation in Domain: $AD"
+          chmod 600 ~/.oci/config
 
-            # REMOVED --wait-for-state RUNNING to allow instantaneous out-of-capacity checking
+          echo "Installing OCI CLI..."
+          python -m pip install --upgrade pip
+          pip install oci-cli
+
+          echo "OCI CLI installed successfully."
+
+          oci --version
+
+
+      # ------------------------------------------------------------
+      # Provisioner
+      # ------------------------------------------------------------
+      - name: Check OCI capacity every minute
+        shell: bash
+        env:
+          COMPARTMENT: ${{ vars.OCI_COMPARTMENT_ID }}
+          SUBNET: ${{ vars.OCI_SUBNET_ID }}
+          IMAGE: ${{ vars.OCI_IMAGE_ID }}
+          SSH_KEY: ${{ vars.SSH_PUBLIC_KEY }}
+
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+
+        run: |
+          set -uo pipefail
+
+          # ==========================================================
+          # CONFIGURATION
+          # ==========================================================
+
+          CHECK_INTERVAL=60
+
+          echo "======================================================"
+          echo "Oracle Always Free A1 Provisioner"
+          echo "======================================================"
+          echo "Check interval: ${CHECK_INTERVAL} seconds"
+          echo "Region: us-chicago-1"
+          echo "======================================================"
+
+          # ----------------------------------------------------------
+          # Create SSH public key file
+          # ----------------------------------------------------------
+
+          echo "Creating SSH public key file..."
+
+          printf '%s\n' "$SSH_KEY" > instance_key.pub
+
+          chmod 600 instance_key.pub
+
+
+          # ==========================================================
+          # TELEGRAM FUNCTION
+          # ==========================================================
+
+          send_telegram() {
+            local MESSAGE="$1"
+
+            if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
+              echo "Telegram credentials are not configured."
+              return 0
+            fi
+
+            echo "Sending Telegram notification..."
+
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --max-time 15 \
+              -X POST \
+              "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              -d "chat_id=${TG_CHAT}" \
+              --data-urlencode "text=${MESSAGE}" \
+              || echo "WARNING: Telegram notification failed."
+          }
+
+
+          # ==========================================================
+          # CHECK EXISTING INSTANCE
+          # ==========================================================
+
+          check_existing_instance() {
+
+            echo "Checking for existing Ampere A1 instances..."
+
+            EXISTING_VMS=$(oci compute instance list \
+              --compartment-id "$COMPARTMENT" \
+              --all \
+              --query "data[?shape=='VM.Standard.A1.Flex' && 'lifecycle-state'!='TERMINATED'].id" \
+              --output json 2>/dev/null)
+
+            OCI_STATUS=$?
+
+            if [ $OCI_STATUS -ne 0 ]; then
+              echo "WARNING: Failed to query existing instances."
+              return 2
+            fi
+
+            echo "Existing A1 instances: $EXISTING_VMS"
+
+            if [ "$EXISTING_VMS" != "[]" ] && [ -n "$EXISTING_VMS" ]; then
+              return 0
+            fi
+
+            return 1
+          }
+
+
+          # ==========================================================
+          # GET AVAILABILITY DOMAINS
+          # ==========================================================
+
+          get_availability_domains() {
+
+            echo "Fetching availability domains..."
+
+            AD_JSON=$(oci iam availability-domain list \
+              --compartment-id "$COMPARTMENT" \
+              --query "data[].name" \
+              --output json 2>/dev/null)
+
+            OCI_STATUS=$?
+
+            if [ $OCI_STATUS -ne 0 ]; then
+              echo "ERROR: Could not retrieve availability domains."
+              return 1
+            fi
+
+            if [ -z "$AD_JSON" ] || [ "$AD_JSON" = "[]" ]; then
+              echo "ERROR: No availability domains returned."
+              return 1
+            fi
+
+            echo "Availability domains:"
+            echo "$AD_JSON" | jq -r '.[]'
+
+            return 0
+          }
+
+
+          # ==========================================================
+          # TRY CREATE INSTANCE
+          # ==========================================================
+
+          try_create_instance() {
+
+            local AD="$1"
+
+            echo ""
+            echo "------------------------------------------------------"
+            echo "Attempting A1 instance creation"
+            echo "Availability Domain: $AD"
+            echo "------------------------------------------------------"
+
+            # Do NOT use --wait-for-state here.
+            #
+            # We only care whether OCI accepts the launch request.
+            # Waiting for RUNNING would unnecessarily consume time.
+
             oci compute instance launch \
               --availability-domain "$AD" \
               --compartment-id "$COMPARTMENT" \
@@ -82,26 +223,140 @@ jobs:
               --display-name "AlwaysFree-ARM-Server" \
               --ssh-authorized-keys-file instance_key.pub
 
-            if [ $? -eq 0 ]; then
-              echo "SUCCESS: Instance initialization request accepted in $AD!"
-              SUCCESS=true
-              
-              MESSAGE="🎉 SUCCESS! Your Oracle Always Free VM request was accepted in domain $AD! It is now provisioning. 🚀"
-              curl -s -X POST "https://telegram.org{TG_TOKEN}/sendMessage" \
-                -d "chat_id=${TG_CHAT}" \
-                -d "text=${MESSAGE}"
-                
-              break 2 
-            else
-              echo "Capacity error in $AD. Moving to next domain immediately..."
-            fi
-          done
-          
-          echo "Checked all domains. Waiting exactly 60 seconds before next scan loop..."
-          sleep 60
-        done
+            OCI_STATUS=$?
 
-        if [ "$SUCCESS" = false ]; then
-          echo "All availability domains are currently out of stock for this 5-minute block window."
-          exit 0
-        fi
+            if [ $OCI_STATUS -eq 0 ]; then
+
+              echo ""
+              echo "======================================================"
+              echo "🎉 SUCCESS!"
+              echo "======================================================"
+              echo "OCI accepted the instance creation request."
+              echo "Availability Domain: $AD"
+              echo "======================================================"
+
+              send_telegram \
+                "🎉 SUCCESS! Oracle Always Free VM launch request was accepted in ${AD}. The instance is now provisioning. 🚀"
+
+              return 0
+            fi
+
+            echo "No capacity / launch failed in $AD."
+
+            return 1
+          }
+
+
+          # ==========================================================
+          # MAIN LOOP
+          # ==========================================================
+
+          CHECK_NUMBER=0
+
+          while true; do
+
+            CHECK_NUMBER=$((CHECK_NUMBER + 1))
+
+            echo ""
+            echo ""
+            echo "======================================================"
+            echo "CHECK #${CHECK_NUMBER}"
+            echo "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "======================================================"
+
+
+            # --------------------------------------------------------
+            # Check if VM already exists
+            # --------------------------------------------------------
+
+            check_existing_instance
+
+            EXISTING_STATUS=$?
+
+            if [ $EXISTING_STATUS -eq 0 ]; then
+
+              echo ""
+              echo "======================================================"
+              echo "A1 INSTANCE ALREADY EXISTS"
+              echo "Nothing more to do."
+              echo "======================================================"
+
+              exit 0
+
+            elif [ $EXISTING_STATUS -eq 2 ]; then
+
+              echo "Could not reliably determine existing instances."
+              echo "Will retry on the next cycle."
+
+            else
+
+              echo "No existing A1 instance found."
+
+
+              # ------------------------------------------------------
+              # Get Availability Domains
+              # ------------------------------------------------------
+
+              if get_availability_domains; then
+
+                SUCCESS=false
+
+                # ----------------------------------------------------
+                # Try every availability domain
+                # ----------------------------------------------------
+
+                for AD in $(echo "$AD_JSON" | jq -r '.[]'); do
+
+                  # Remove whitespace just in case.
+                  AD=$(echo "$AD" | xargs)
+
+                  if [ -z "$AD" ]; then
+                    continue
+                  fi
+
+                  if try_create_instance "$AD"; then
+                    SUCCESS=true
+                    break
+                  fi
+
+                  echo "Trying next availability domain..."
+                done
+
+
+                # ----------------------------------------------------
+                # Stop after successful creation
+                # ----------------------------------------------------
+
+                if [ "$SUCCESS" = true ]; then
+
+                  echo ""
+                  echo "Instance creation request succeeded."
+                  echo "Stopping provisioner."
+
+                  exit 0
+                fi
+
+                echo ""
+                echo "No availability domain accepted the request."
+                echo "Will retry in ${CHECK_INTERVAL} seconds."
+
+              else
+
+                echo "Could not retrieve availability domains."
+                echo "Will retry in ${CHECK_INTERVAL} seconds."
+
+              fi
+
+            fi
+
+
+            # ========================================================
+            # WAIT EXACTLY 60 SECONDS
+            # ========================================================
+
+            echo ""
+            echo "Next capacity check in ${CHECK_INTERVAL} seconds..."
+
+            sleep "$CHECK_INTERVAL"
+
+          done
