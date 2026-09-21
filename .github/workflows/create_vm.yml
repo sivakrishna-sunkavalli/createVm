@@ -2,21 +2,26 @@ name: Oracle Always Free A1 Provisioner
 
 on:
   schedule:
-    # GitHub's minimum scheduled interval.
-    # The actual OCI checks happen every 60 seconds inside the job.
+    # GitHub's scheduler has a 5-minute minimum.
+    # The running job performs the actual OCI check every 60 seconds.
     - cron: '*/5 * * * *'
 
   workflow_dispatch:
 
+# Prevent multiple provisioner jobs from competing with each other.
 concurrency:
   group: oracle-a1-provisioner
   cancel-in-progress: false
 
+
 jobs:
+
   launch-instance:
+
     runs-on: ubuntu-latest
 
-    # Keep the runner alive and checking.
+    # GitHub-hosted runner maximum depends on plan.
+    # Keep this below the normal GitHub-hosted job limit.
     timeout-minutes: 350
 
     steps:
@@ -27,6 +32,13 @@ jobs:
 
       - name: Install and configure OCI CLI
         shell: bash
+
+        env:
+          OCI_KEY_FILE: ${{ secrets.OCI_KEY_FILE }}
+          OCI_USER_ID: ${{ secrets.OCI_USER_ID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY_ID: ${{ secrets.OCI_TENANCY_ID }}
+
         run: |
           set -u
 
@@ -34,46 +46,79 @@ jobs:
           echo "Installing OCI CLI"
           echo "======================================================"
 
-          mkdir -p ~/.oci
+          mkdir -p "$HOME/.oci"
 
-          echo "Writing OCI private key..."
 
-          printf '%s\n' '${{ secrets.OCI_KEY_FILE }}' \
-            > ~/.oci/oci_api_key.pem
+          # ----------------------------------------------------------
+          # Write private key
+          # ----------------------------------------------------------
 
-          chmod 600 ~/.oci/oci_api_key.pem
+          if [ -z "${OCI_KEY_FILE:-}" ]; then
+            echo "ERROR: OCI_KEY_FILE secret is empty."
+            exit 1
+          fi
 
-          echo "Writing OCI configuration..."
+          printf '%s\n' "$OCI_KEY_FILE" \
+            > "$HOME/.oci/oci_api_key.pem"
 
-          cat > ~/.oci/config <<EOF
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+
+
+          # ----------------------------------------------------------
+          # Write OCI config
+          # ----------------------------------------------------------
+
+          if [ -z "${OCI_USER_ID:-}" ]; then
+            echo "ERROR: OCI_USER_ID secret is empty."
+            exit 1
+          fi
+
+          if [ -z "${OCI_FINGERPRINT:-}" ]; then
+            echo "ERROR: OCI_FINGERPRINT secret is empty."
+            exit 1
+          fi
+
+          if [ -z "${OCI_TENANCY_ID:-}" ]; then
+            echo "ERROR: OCI_TENANCY_ID secret is empty."
+            exit 1
+          fi
+
+
+          cat > "$HOME/.oci/config" <<EOF
           [DEFAULT]
-          user=${{ secrets.OCI_USER_ID }}
-          fingerprint=${{ secrets.OCI_FINGERPRINT }}
-          tenancy=${{ secrets.OCI_TENANCY_ID }}
+          user=${OCI_USER_ID}
+          fingerprint=${OCI_FINGERPRINT}
+          tenancy=${OCI_TENANCY_ID}
           region=us-chicago-1
-          key_file=~/.oci/oci_api_key.pem
+          key_file=${HOME}/.oci/oci_api_key.pem
           EOF
 
-          chmod 600 ~/.oci/config
+          chmod 600 "$HOME/.oci/config"
+
+
+          # ----------------------------------------------------------
+          # Install OCI CLI
+          # ----------------------------------------------------------
 
           echo "Installing OCI CLI..."
 
           python -m pip install --upgrade pip
-          pip install oci-cli
+
+          python -m pip install --upgrade oci-cli
+
+
+          # ----------------------------------------------------------
+          # Verify installation
+          # ----------------------------------------------------------
 
           echo ""
           echo "OCI CLI version:"
+
           oci --version
 
-          echo ""
-          echo "Testing OCI authentication..."
 
-          if oci iam region list --output json >/dev/null 2>&1; then
-            echo "OCI authentication test passed."
-          else
-            echo "WARNING: OCI authentication test failed."
-            echo "The provisioner will continue and retry."
-          fi
+          echo ""
+          echo "OCI configuration created successfully."
 
 
       # ============================================================
@@ -84,118 +129,204 @@ jobs:
         shell: bash
 
         env:
+
+          # OCI configuration
+          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+          SUPPRESS_LABEL_WARNING: "True"
+
+          # OCI resources
           COMPARTMENT: ${{ vars.OCI_COMPARTMENT_ID }}
           SUBNET: ${{ vars.OCI_SUBNET_ID }}
           IMAGE: ${{ vars.OCI_IMAGE_ID }}
+
+          # SSH
           SSH_KEY: ${{ vars.SSH_PUBLIC_KEY }}
 
+          # Telegram
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
-
         run: |
-          # IMPORTANT:
+
+          # ==========================================================
+          # IMPORTANT
+          # ==========================================================
           #
-          # Do NOT use "set -e".
+          # Do NOT enable "set -e".
           #
-          # OCI capacity errors are expected while searching for
-          # an Always Free A1 instance.
+          # OCI launch failures are expected when A1 capacity is
+          # unavailable. Every command is therefore handled manually.
           #
-          # Every OCI command is handled explicitly.
 
           set -u
 
+
+          # ==========================================================
+          # CONFIGURATION
+          # ==========================================================
+
           CHECK_INTERVAL=60
+
+          REGION="us-chicago-1"
 
           echo ""
           echo "======================================================"
           echo "Oracle Always Free A1 Provisioner"
           echo "======================================================"
           echo "Check interval: ${CHECK_INTERVAL} seconds"
-          echo "Region: us-chicago-1"
+          echo "Region: ${REGION}"
           echo "======================================================"
 
 
           # ==========================================================
-          # BASIC CONFIGURATION CHECK
+          # VALIDATE ENVIRONMENT
           # ==========================================================
 
           echo ""
-          echo "Checking required configuration..."
+          echo "Validating configuration..."
+
 
           if [ -z "${COMPARTMENT:-}" ]; then
             echo "ERROR: OCI_COMPARTMENT_ID is empty."
             exit 1
           fi
 
+
           if [ -z "${SUBNET:-}" ]; then
             echo "ERROR: OCI_SUBNET_ID is empty."
             exit 1
           fi
+
 
           if [ -z "${IMAGE:-}" ]; then
             echo "ERROR: OCI_IMAGE_ID is empty."
             exit 1
           fi
 
+
           if [ -z "${SSH_KEY:-}" ]; then
             echo "ERROR: SSH_PUBLIC_KEY is empty."
             exit 1
           fi
 
-          echo "Required configuration is present."
+
+          echo "Configuration validation passed."
 
 
           # ==========================================================
-          # SSH KEY
+          # CREATE SSH PUBLIC KEY
           # ==========================================================
 
           echo ""
           echo "Creating SSH public key file..."
 
+
           printf '%s\n' "$SSH_KEY" > instance_key.pub
 
           chmod 600 instance_key.pub
+
+
+          if [ ! -s instance_key.pub ]; then
+            echo "ERROR: SSH public key file is empty."
+            exit 1
+          fi
+
 
           echo "SSH public key created."
 
 
           # ==========================================================
-          # TELEGRAM
+          # TELEGRAM FUNCTION
           # ==========================================================
 
           send_telegram() {
 
             local MESSAGE="$1"
 
-            if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
-              echo "Telegram credentials not configured."
+
+            if [ -z "${TG_TOKEN:-}" ]; then
+              echo "Telegram token not configured."
               return 0
             fi
 
+
+            if [ -z "${TG_CHAT:-}" ]; then
+              echo "Telegram chat ID not configured."
+              return 0
+            fi
+
+
             echo "Sending Telegram notification..."
+
 
             curl \
               --silent \
               --show-error \
               --fail \
-              --max-time 15 \
+              --max-time 20 \
+              --retry 2 \
               -X POST \
               "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
               -d "chat_id=${TG_CHAT}" \
-              --data-urlencode "text=${MESSAGE}"
+              --data-urlencode "text=${MESSAGE}" \
+              >/dev/null
 
-            local CURL_STATUS=$?
 
-            if [ $CURL_STATUS -ne 0 ]; then
+            CURL_STATUS=$?
+
+
+            if [ "$CURL_STATUS" -ne 0 ]; then
               echo "WARNING: Telegram notification failed."
             else
               echo "Telegram notification sent."
             fi
 
+
             return 0
           }
+
+
+          # ==========================================================
+          # OCI AUTHENTICATION TEST
+          # ==========================================================
+
+          echo ""
+          echo "Testing OCI authentication..."
+
+
+          AUTH_OUTPUT=$(mktemp)
+
+
+          oci iam region list \
+            --output json \
+            > "$AUTH_OUTPUT" 2>&1
+
+
+          AUTH_STATUS=$?
+
+
+          if [ "$AUTH_STATUS" -ne 0 ]; then
+
+            echo ""
+            echo "WARNING: OCI authentication test failed."
+            echo "OCI exit code: $AUTH_STATUS"
+            echo ""
+            echo "OCI response:"
+            cat "$AUTH_OUTPUT"
+
+            rm -f "$AUTH_OUTPUT"
+
+            echo ""
+            echo "The provisioner will continue."
+            echo "The next loop will retry."
+
+          else
+
+            echo "OCI authentication test passed."
+
+            rm -f "$AUTH_OUTPUT"
+
+          fi
 
 
           # ==========================================================
@@ -207,65 +338,158 @@ jobs:
             echo ""
             echo "Checking for existing Ampere A1 instances..."
 
-            # Use a temporary file so that stderr doesn't get mixed
-            # into the JSON variable.
 
-            TEMP_OUTPUT=$(mktemp)
+            OUTPUT_FILE=$(mktemp)
+
+
+            # IMPORTANT:
+            #
+            # stdout contains JSON.
+            # stderr contains diagnostics.
+            #
+            # The security warning from OCI CLI can appear in output
+            # depending on CLI version, so we filter the result before
+            # giving it to jq.
 
             oci compute instance list \
               --compartment-id "$COMPARTMENT" \
               --all \
-              --query "data[?shape=='VM.Standard.A1.Flex' && 'lifecycle-state'!='TERMINATED'].id" \
               --output json \
-              > "$TEMP_OUTPUT" 2>&1
+              > "$OUTPUT_FILE" 2>&1
+
 
             OCI_STATUS=$?
 
-            if [ $OCI_STATUS -ne 0 ]; then
+
+            if [ "$OCI_STATUS" -ne 0 ]; then
 
               echo ""
-              echo "WARNING: OCI instance query failed."
+              echo "WARNING: OCI instance list failed."
               echo "OCI exit code: $OCI_STATUS"
+              echo ""
               echo "OCI response:"
+              cat "$OUTPUT_FILE"
 
-              cat "$TEMP_OUTPUT"
+              rm -f "$OUTPUT_FILE"
 
-              rm -f "$TEMP_OUTPUT"
-
-              # 2 = API/query failure.
               return 2
+
             fi
 
-            EXISTING_VMS=$(cat "$TEMP_OUTPUT")
 
-            rm -f "$TEMP_OUTPUT"
+            # --------------------------------------------------------
+            # Extract JSON from the OCI response.
+            #
+            # OCI warnings may be printed before the JSON.
+            # Find the first line beginning with { and parse from there.
+            # --------------------------------------------------------
 
-            echo "Existing A1 instances: ${EXISTING_VMS:-<none>}"
+            JSON_FILE=$(mktemp)
 
-            # Make sure the response is valid JSON.
 
-            if ! echo "$EXISTING_VMS" | jq empty >/dev/null 2>&1; then
+            awk '
+              BEGIN { found=0 }
+              /^[[:space:]]*\{/ {
+                found=1
+              }
+              found {
+                print
+              }
+            ' "$OUTPUT_FILE" > "$JSON_FILE"
 
+
+            rm -f "$OUTPUT_FILE"
+
+
+            if [ ! -s "$JSON_FILE" ]; then
+
+              echo ""
+              echo "WARNING: OCI returned no JSON data."
+
+              echo "Raw OCI output was:"
+              cat "$JSON_FILE"
+
+              rm -f "$JSON_FILE"
+
+              return 2
+
+            fi
+
+
+            # --------------------------------------------------------
+            # Validate JSON
+            # --------------------------------------------------------
+
+            if ! jq empty "$JSON_FILE" >/dev/null 2>&1; then
+
+              echo ""
               echo "WARNING: OCI returned invalid JSON."
+
               echo "Response:"
-              echo "$EXISTING_VMS"
+              cat "$JSON_FILE"
+
+              rm -f "$JSON_FILE"
 
               return 2
+
             fi
 
-            # Check whether the returned array contains anything.
+
+            # --------------------------------------------------------
+            # Filter A1 instances
+            # --------------------------------------------------------
+
+            EXISTING_VMS=$(jq -c '
+              [
+                .data[]
+                | select(
+                    .shape == "VM.Standard.A1.Flex"
+                    and .["lifecycle-state"] != "TERMINATED"
+                  )
+                | .id
+              ]
+            ' "$JSON_FILE" 2>/dev/null)
+
+
+            JQ_STATUS=$?
+
+
+            rm -f "$JSON_FILE"
+
+
+            if [ "$JQ_STATUS" -ne 0 ]; then
+
+              echo "WARNING: Could not process OCI instance data."
+
+              return 2
+
+            fi
+
+
+            echo "Existing A1 instances: ${EXISTING_VMS}"
+
 
             INSTANCE_COUNT=$(echo "$EXISTING_VMS" | jq 'length' 2>/dev/null)
 
+
             if [ -z "$INSTANCE_COUNT" ]; then
-              echo "WARNING: Could not parse instance count."
+
+              echo "WARNING: Could not determine instance count."
+
               return 2
+
             fi
 
+
             if [ "$INSTANCE_COUNT" -gt 0 ]; then
-              echo "An A1 instance already exists."
+
+              echo ""
+              echo "A1 instance already exists."
+
               return 0
+
             fi
+
 
             echo "No A1 instance currently exists."
 
@@ -282,75 +506,132 @@ jobs:
             echo ""
             echo "Fetching availability domains..."
 
-            AD_TEMP=$(mktemp)
+
+            OUTPUT_FILE=$(mktemp)
+
 
             oci iam availability-domain list \
               --compartment-id "$COMPARTMENT" \
-              --query "data[].name" \
               --output json \
-              > "$AD_TEMP" 2>&1
+              > "$OUTPUT_FILE" 2>&1
+
 
             OCI_STATUS=$?
 
-            if [ $OCI_STATUS -ne 0 ]; then
+
+            if [ "$OCI_STATUS" -ne 0 ]; then
 
               echo ""
-              echo "WARNING: Failed to retrieve availability domains."
+              echo "WARNING: Availability-domain request failed."
               echo "OCI exit code: $OCI_STATUS"
+              echo ""
               echo "OCI response:"
+              cat "$OUTPUT_FILE"
 
-              cat "$AD_TEMP"
-
-              rm -f "$AD_TEMP"
+              rm -f "$OUTPUT_FILE"
 
               return 1
+
             fi
 
-            AD_JSON=$(cat "$AD_TEMP")
 
-            rm -f "$AD_TEMP"
+            # Extract JSON, ignoring any OCI warning text.
+            awk '
+              BEGIN { found=0 }
+              /^[[:space:]]*\{/ {
+                found=1
+              }
+              found {
+                print
+              }
+            ' "$OUTPUT_FILE" > "${OUTPUT_FILE}.json"
 
-            if [ -z "$AD_JSON" ]; then
-              echo "WARNING: Availability domain response is empty."
+
+            rm -f "$OUTPUT_FILE"
+
+
+            if [ ! -s "${OUTPUT_FILE}.json" ]; then
+
+              echo "WARNING: No availability-domain JSON returned."
+
+              rm -f "${OUTPUT_FILE}.json"
+
               return 1
+
             fi
 
-            if ! echo "$AD_JSON" | jq empty >/dev/null 2>&1; then
-              echo "WARNING: Availability domain response is invalid JSON."
-              echo "$AD_JSON"
+
+            if ! jq empty "${OUTPUT_FILE}.json" >/dev/null 2>&1; then
+
+              echo "WARNING: Availability-domain JSON is invalid."
+
+              cat "${OUTPUT_FILE}.json"
+
+              rm -f "${OUTPUT_FILE}.json"
+
               return 1
+
             fi
+
+
+            AD_JSON=$(jq -c '.data | map(.name)' "${OUTPUT_FILE}.json" 2>/dev/null)
+
+
+            JQ_STATUS=$?
+
+
+            rm -f "${OUTPUT_FILE}.json"
+
+
+            if [ "$JQ_STATUS" -ne 0 ] || [ -z "$AD_JSON" ]; then
+
+              echo "WARNING: Could not parse availability domains."
+
+              return 1
+
+            fi
+
 
             AD_COUNT=$(echo "$AD_JSON" | jq 'length')
 
+
             if [ "$AD_COUNT" -eq 0 ]; then
+
               echo "WARNING: No availability domains found."
+
               return 1
+
             fi
 
-            echo "Found $AD_COUNT availability domain(s):"
+
+            echo ""
+            echo "Found ${AD_COUNT} availability domain(s):"
 
             echo "$AD_JSON" | jq -r '.[]'
+
 
             return 0
           }
 
 
           # ==========================================================
-          # TRY INSTANCE CREATION
+          # ATTEMPT INSTANCE CREATION
           # ==========================================================
 
           try_create_instance() {
 
             local AD="$1"
 
+
             echo ""
             echo "------------------------------------------------------"
             echo "Attempting VM creation"
-            echo "Availability Domain: $AD"
+            echo "Availability Domain: ${AD}"
             echo "------------------------------------------------------"
 
-            LAUNCH_OUTPUT=$(mktemp)
+
+            OUTPUT_FILE=$(mktemp)
+
 
             oci compute instance launch \
               --availability-domain "$AD" \
@@ -362,41 +643,49 @@ jobs:
               --assign-public-ip true \
               --display-name "AlwaysFree-ARM-Server" \
               --ssh-authorized-keys-file instance_key.pub \
-              > "$LAUNCH_OUTPUT" 2>&1
+              --output json \
+              > "$OUTPUT_FILE" 2>&1
+
 
             OCI_STATUS=$?
 
-            if [ $OCI_STATUS -eq 0 ]; then
+
+            if [ "$OCI_STATUS" -eq 0 ]; then
 
               echo ""
               echo "======================================================"
               echo "SUCCESS!"
               echo "======================================================"
               echo "OCI accepted the VM creation request."
-              echo "Availability Domain: $AD"
+              echo "Availability Domain: ${AD}"
               echo ""
               echo "OCI response:"
-              cat "$LAUNCH_OUTPUT"
+              cat "$OUTPUT_FILE"
               echo "======================================================"
 
-              rm -f "$LAUNCH_OUTPUT"
+
+              rm -f "$OUTPUT_FILE"
+
 
               send_telegram \
                 "🎉 SUCCESS! Oracle Always Free VM request was accepted in ${AD}! The VM is now provisioning. 🚀"
 
+
               return 0
+
             fi
 
 
             echo ""
-            echo "VM creation failed in $AD."
-            echo "OCI exit code: $OCI_STATUS"
+            echo "VM creation was not accepted in ${AD}."
+            echo "OCI exit code: ${OCI_STATUS}"
             echo ""
             echo "OCI response:"
-            cat "$LAUNCH_OUTPUT"
-            echo ""
+            cat "$OUTPUT_FILE"
 
-            rm -f "$LAUNCH_OUTPUT"
+
+            rm -f "$OUTPUT_FILE"
+
 
             return 1
           }
@@ -408,9 +697,11 @@ jobs:
 
           CHECK_NUMBER=0
 
+
           while true; do
 
             CHECK_NUMBER=$((CHECK_NUMBER + 1))
+
 
             echo ""
             echo ""
@@ -420,62 +711,60 @@ jobs:
             echo "======================================================"
 
 
-            # --------------------------------------------------------
-            # CHECK EXISTING VM
-            # --------------------------------------------------------
+            # ========================================================
+            # CHECK FOR EXISTING INSTANCE
+            # ========================================================
 
             check_existing_instance
 
             EXISTING_STATUS=$?
 
 
-            # ========================================================
-            # VM ALREADY EXISTS
-            # ========================================================
+            # --------------------------------------------------------
+            # A1 INSTANCE FOUND
+            # --------------------------------------------------------
 
-            if [ $EXISTING_STATUS -eq 0 ]; then
+            if [ "$EXISTING_STATUS" -eq 0 ]; then
 
               echo ""
               echo "======================================================"
               echo "A1 INSTANCE ALREADY EXISTS"
               echo "======================================================"
-              echo "Provisioner finished."
+              echo "Stopping provisioner."
 
               exit 0
+
             fi
 
 
-            # ========================================================
-            # OCI QUERY FAILED
-            # ========================================================
+            # --------------------------------------------------------
+            # OCI QUERY ERROR
+            # --------------------------------------------------------
 
-            if [ $EXISTING_STATUS -eq 2 ]; then
+            if [ "$EXISTING_STATUS" -eq 2 ]; then
 
               echo ""
-              echo "OCI instance query failed."
-              echo "This is NOT treated as a fatal workflow error."
+              echo "OCI query failed."
+              echo "This is treated as a temporary error."
               echo "Retrying in ${CHECK_INTERVAL} seconds."
 
               sleep "$CHECK_INTERVAL"
 
               continue
+
             fi
 
 
             # ========================================================
-            # NO INSTANCE EXISTS
+            # GET AVAILABILITY DOMAINS
             # ========================================================
 
-            echo ""
-            echo "No existing A1 instance found."
-            echo "Searching availability domains..."
+            get_availability_domains
+
+            AD_STATUS=$?
 
 
-            # --------------------------------------------------------
-            # GET AVAILABILITY DOMAINS
-            # --------------------------------------------------------
-
-            if ! get_availability_domains; then
+            if [ "$AD_STATUS" -ne 0 ]; then
 
               echo ""
               echo "Could not retrieve availability domains."
@@ -484,23 +773,26 @@ jobs:
               sleep "$CHECK_INTERVAL"
 
               continue
+
             fi
 
 
             SUCCESS=false
 
 
-            # --------------------------------------------------------
-            # TRY EVERY AVAILABILITY DOMAIN
-            # --------------------------------------------------------
+            # ========================================================
+            # TRY EACH AVAILABILITY DOMAIN
+            # ========================================================
 
             while IFS= read -r AD; do
 
               AD=$(echo "$AD" | xargs)
 
+
               if [ -z "$AD" ]; then
                 continue
               fi
+
 
               if try_create_instance "$AD"; then
 
@@ -509,6 +801,10 @@ jobs:
                 break
 
               fi
+
+
+              echo ""
+              echo "Trying next availability domain..."
 
             done < <(echo "$AD_JSON" | jq -r '.[]')
 
@@ -523,14 +819,15 @@ jobs:
               echo "======================================================"
               echo "VM CREATION REQUEST ACCEPTED"
               echo "======================================================"
-              echo "Stopping provisioner."
+              echo "Provisioner completed successfully."
 
               exit 0
+
             fi
 
 
             # ========================================================
-            # NOTHING AVAILABLE
+            # NO CAPACITY
             # ========================================================
 
             echo ""
@@ -538,13 +835,14 @@ jobs:
             echo "NO A1 CAPACITY FOUND"
             echo "======================================================"
             echo "All availability domains were attempted."
+            echo ""
             echo "Next check in ${CHECK_INTERVAL} seconds."
             echo "======================================================"
 
 
-            # --------------------------------------------------------
-            # EXACT 60 SECOND WAIT
-            # --------------------------------------------------------
+            # ========================================================
+            # WAIT 60 SECONDS
+            # ========================================================
 
             sleep "$CHECK_INTERVAL"
 
