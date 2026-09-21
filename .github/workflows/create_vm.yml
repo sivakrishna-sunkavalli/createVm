@@ -2,88 +2,40 @@ name: Oracle Always Free A1 Provisioner
 
 on:
   schedule:
-    # GitHub minimum scheduled interval.
-    # The actual OCI checks run every 60 seconds inside the job.
     - cron: "*/5 * * * *"
-
   workflow_dispatch:
 
 concurrency:
   group: oracle-a1-provisioner
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
-
   launch-instance:
-
     runs-on: ubuntu-latest
-
     timeout-minutes: 350
 
     steps:
-
-      # ============================================================
-      # INSTALL OCI CLI
-      # ============================================================
-
-      - name: Install and configure OCI CLI
+      - name: Install OCI CLI
         shell: bash
-
         env:
           OCI_KEY_FILE: ${{ secrets.OCI_KEY_FILE }}
           OCI_USER_ID: ${{ secrets.OCI_USER_ID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
           OCI_TENANCY_ID: ${{ secrets.OCI_TENANCY_ID }}
-
         run: |
-
-          set -u
-
-          echo "======================================================"
-          echo "Installing OCI CLI"
-          echo "======================================================"
+          set +e
+          set +H
 
           mkdir -p "$HOME/.oci"
 
-
-          # ----------------------------------------------------------
-          # Validate secrets
-          # ----------------------------------------------------------
-
-          if [ -z "${OCI_KEY_FILE:-}" ]; then
-            echo "ERROR: OCI_KEY_FILE secret is empty."
+          if [ -z "${OCI_KEY_FILE:-}" ] || [ -z "${OCI_USER_ID:-}" ] || [ -z "${OCI_FINGERPRINT:-}" ] || [ -z "${OCI_TENANCY_ID:-}" ]; then
+            echo "ERROR: one or more OCI secrets are empty."
             exit 1
           fi
 
-          if [ -z "${OCI_USER_ID:-}" ]; then
-            echo "ERROR: OCI_USER_ID secret is empty."
-            exit 1
-          fi
-
-          if [ -z "${OCI_FINGERPRINT:-}" ]; then
-            echo "ERROR: OCI_FINGERPRINT secret is empty."
-            exit 1
-          fi
-
-          if [ -z "${OCI_TENANCY_ID:-}" ]; then
-            echo "ERROR: OCI_TENANCY_ID secret is empty."
-            exit 1
-          fi
-
-
-          # ----------------------------------------------------------
-          # Private key
-          # ----------------------------------------------------------
-
-          printf '%s\n' "$OCI_KEY_FILE" \
-            > "$HOME/.oci/oci_api_key.pem"
-
+          # Support both real newlines and literal \n in the secret
+          printf '%s\n' "$OCI_KEY_FILE" | sed 's/\\n/\n/g' > "$HOME/.oci/oci_api_key.pem"
           chmod 600 "$HOME/.oci/oci_api_key.pem"
-
-
-          # ----------------------------------------------------------
-          # OCI config
-          # ----------------------------------------------------------
 
           cat > "$HOME/.oci/config" <<EOF
           [DEFAULT]
@@ -93,514 +45,141 @@ jobs:
           region=us-chicago-1
           key_file=${HOME}/.oci/oci_api_key.pem
           EOF
-
           chmod 600 "$HOME/.oci/config"
 
+          python3 -m pip install --user --upgrade pip oci-cli
 
-          # ----------------------------------------------------------
-          # Install CLI
-          # ----------------------------------------------------------
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
 
-          python -m pip install --upgrade pip
-
-          python -m pip install --upgrade oci-cli
-
-
-          echo ""
-          echo "OCI CLI version:"
           oci --version
 
-
-          # ----------------------------------------------------------
-          # Authentication test
-          # ----------------------------------------------------------
-
-          echo ""
-          echo "Testing OCI authentication..."
-
-          AUTH_STDOUT=$(mktemp)
-          AUTH_STDERR=$(mktemp)
-
-          oci iam region list \
-            --output json \
-            >"$AUTH_STDOUT" \
-            2>"$AUTH_STDERR"
-
-          AUTH_STATUS=$?
-
-
-          if [ "$AUTH_STATUS" -ne 0 ]; then
-
-            echo ""
-            echo "======================================================"
-            echo "OCI AUTHENTICATION TEST FAILED"
-            echo "======================================================"
-
-            echo ""
-            echo "STDOUT:"
-            cat "$AUTH_STDOUT"
-
-            echo ""
-            echo "STDERR:"
-            cat "$AUTH_STDERR"
-
-            echo ""
-            echo "Exit code: $AUTH_STATUS"
-
-            rm -f "$AUTH_STDOUT" "$AUTH_STDERR"
-
+          if ! oci iam region list --output json >/dev/null; then
+            echo "OCI AUTHENTICATION FAILED"
+            oci iam region list --output json
             exit 1
-
           fi
 
-
-          echo "OCI authentication test passed."
-
-          rm -f "$AUTH_STDOUT" "$AUTH_STDERR"
-
-
-      # ============================================================
-      # PROVISIONER
-      # ============================================================
+          echo "OCI authentication successful."
 
       - name: Check OCI capacity every minute
         shell: bash
-
         env:
-
-          # ----------------------------------------------------------
-          # OCI CLI warning suppression
-          # ----------------------------------------------------------
-
           SUPPRESS_LABEL_WARNING: "True"
           OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
-
-          # ----------------------------------------------------------
-          # OCI resources
-          # ----------------------------------------------------------
-
           COMPARTMENT: ${{ vars.OCI_COMPARTMENT_ID }}
           SUBNET: ${{ vars.OCI_SUBNET_ID }}
           IMAGE: ${{ vars.OCI_IMAGE_ID }}
-
-          # ----------------------------------------------------------
-          # SSH
-          # ----------------------------------------------------------
-
           SSH_KEY: ${{ vars.SSH_PUBLIC_KEY }}
-
-          # ----------------------------------------------------------
-          # Telegram
-          # ----------------------------------------------------------
-
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
-
         run: |
-
-          # ==========================================================
-          # DO NOT USE set -e
-          # ==========================================================
-
-          set -u
-
-
-          # ==========================================================
-          # CONFIGURATION
-          # ==========================================================
+          set +e
+          set +H
+          set +o pipefail
+          export PATH="$HOME/.local/bin:$PATH"
 
           CHECK_INTERVAL=60
 
-          echo ""
           echo "======================================================"
           echo "Oracle Always Free A1 Provisioner"
-          echo "======================================================"
           echo "Check interval: ${CHECK_INTERVAL} seconds"
           echo "Region: us-chicago-1"
           echo "======================================================"
 
-
-          # ==========================================================
-          # VALIDATE VARIABLES
-          # ==========================================================
-
-          echo ""
-          echo "Validating configuration..."
-
-
-          if [ -z "${COMPARTMENT:-}" ]; then
-            echo "ERROR: OCI_COMPARTMENT_ID is empty."
-            exit 1
+          if ! command -v oci >/dev/null 2>&1; then
+            echo "oci not on PATH; installing..."
+            python3 -m pip install --user --upgrade oci-cli
+            export PATH="$HOME/.local/bin:$PATH"
           fi
 
-
-          if [ -z "${SUBNET:-}" ]; then
-            echo "ERROR: OCI_SUBNET_ID is empty."
+          if [ -z "${COMPARTMENT:-}" ] || [ -z "${SUBNET:-}" ] || [ -z "${IMAGE:-}" ] || [ -z "${SSH_KEY:-}" ]; then
+            echo "ERROR: missing OCI_COMPARTMENT_ID, OCI_SUBNET_ID, OCI_IMAGE_ID, or SSH_PUBLIC_KEY."
             exit 1
           fi
-
-
-          if [ -z "${IMAGE:-}" ]; then
-            echo "ERROR: OCI_IMAGE_ID is empty."
-            exit 1
-          fi
-
-
-          if [ -z "${SSH_KEY:-}" ]; then
-            echo "ERROR: SSH_PUBLIC_KEY is empty."
-            exit 1
-          fi
-
-
-          echo "Configuration validation passed."
-
-
-          # ==========================================================
-          # SSH KEY
-          # ==========================================================
-
-          echo ""
-          echo "Creating SSH public key file..."
 
           printf '%s\n' "$SSH_KEY" > instance_key.pub
-
-          chmod 600 instance_key.pub
-
-
-          # ==========================================================
-          # TELEGRAM
-          # ==========================================================
+          chmod 644 instance_key.pub
 
           send_telegram() {
-
             local MESSAGE="$1"
-
-            if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
-              echo "Telegram is not configured."
-              return 0
-            fi
-
-            curl \
-              --silent \
-              --show-error \
-              --fail \
-              --max-time 20 \
-              --retry 2 \
-              -X POST \
-              "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            [ -z "${TG_TOKEN:-}" ] && return 0
+            [ -z "${TG_CHAT:-}" ] && return 0
+            curl --silent --show-error --fail --max-time 20 --retry 2 \
+              -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
               -d "chat_id=${TG_CHAT}" \
               --data-urlencode "text=${MESSAGE}" \
-              >/dev/null
-
-            local STATUS=$?
-
-            if [ "$STATUS" -ne 0 ]; then
-              echo "WARNING: Telegram notification failed."
-            else
-              echo "Telegram notification sent."
-            fi
-
-            return 0
+              >/dev/null 2>&1 || true
           }
 
-
-          # ============================================================
-          # CHECK EXISTING INSTANCE
-          # ============================================================
-
-          check_existing_instance() {
-
-            echo ""
-            echo "Checking for existing Ampere A1 instances..."
-
-
-            STDOUT_FILE=$(mktemp)
-            STDERR_FILE=$(mktemp)
-
-
-            # ----------------------------------------------------------
-            # IMPORTANT:
-            #
-            # stdout and stderr are completely separated.
-            # This lets us see the REAL OCI error.
-            # ----------------------------------------------------------
+          # Prints count to stdout. Never exits the job.
+          #  0 = none, >0 = already exists, 255 = query error
+          count_existing_a1() {
+            local OUT ERR CODE COUNT
+            OUT=$(mktemp)
+            ERR=$(mktemp)
 
             oci compute instance list \
               --compartment-id "$COMPARTMENT" \
               --all \
               --output json \
-              >"$STDOUT_FILE" \
-              2>"$STDERR_FILE"
+              >"$OUT" 2>"$ERR"
+            CODE=$?
 
-
-            OCI_STATUS=$?
-
-
-            # ----------------------------------------------------------
-            # OCI command failed
-            # ----------------------------------------------------------
-
-            if [ "$OCI_STATUS" -ne 0 ]; then
-
-              echo ""
-              echo "======================================================"
-              echo "OCI INSTANCE LIST FAILED"
-              echo "======================================================"
-
-              echo ""
-              echo "Exit code:"
-              echo "$OCI_STATUS"
-
-              echo ""
-              echo "OCI STDOUT:"
-              cat "$STDOUT_FILE"
-
-              echo ""
-              echo "OCI STDERR:"
-              cat "$STDERR_FILE"
-
-              echo ""
-              echo "======================================================"
-
-
-              rm -f "$STDOUT_FILE" "$STDERR_FILE"
-
-
-              # Return 2 = temporary OCI error.
-              return 2
-
-            fi
-
-
-            # ----------------------------------------------------------
-            # Make sure stdout isn't empty
-            # ----------------------------------------------------------
-
-            if [ ! -s "$STDOUT_FILE" ]; then
-
-              echo ""
-              echo "WARNING: OCI returned an empty response."
-
-              echo ""
-              echo "OCI STDERR:"
-              cat "$STDERR_FILE"
-
-              rm -f "$STDOUT_FILE" "$STDERR_FILE"
-
-              return 2
-
-            fi
-
-
-            # ----------------------------------------------------------
-            # Validate JSON
-            # ----------------------------------------------------------
-
-            if ! jq empty "$STDOUT_FILE" >/dev/null 2>&1; then
-
-              echo ""
-              echo "WARNING: OCI returned invalid JSON."
-
-              echo ""
-              echo "OCI STDOUT:"
-              cat "$STDOUT_FILE"
-
-              echo ""
-              echo "OCI STDERR:"
-              cat "$STDERR_FILE"
-
-              rm -f "$STDOUT_FILE" "$STDERR_FILE"
-
-              return 2
-
-            fi
-
-
-            # ----------------------------------------------------------
-            # Filter A1 instances
-            # ----------------------------------------------------------
-
-            EXISTING_VMS=$(jq -c '
-              [
-                .data[]
-                | select(
-                    .shape == "VM.Standard.A1.Flex"
-                    and .["lifecycle-state"] != "TERMINATED"
-                  )
-                | .id
-              ]
-            ' "$STDOUT_FILE")
-
-
-            JQ_STATUS=$?
-
-
-            rm -f "$STDOUT_FILE" "$STDERR_FILE"
-
-
-            if [ "$JQ_STATUS" -ne 0 ]; then
-
-              echo "WARNING: Failed to parse OCI instance data."
-
-              return 2
-
-            fi
-
-
-            echo "Existing A1 instances: ${EXISTING_VMS}"
-
-
-            INSTANCE_COUNT=$(echo "$EXISTING_VMS" | jq 'length')
-
-
-            if [ "$INSTANCE_COUNT" -gt 0 ]; then
-
-              echo ""
-              echo "A1 instance already exists."
-
+            if [ "$CODE" -ne 0 ]; then
+              echo "OCI instance list failed (exit $CODE)" >&2
+              cat "$ERR" >&2
+              rm -f "$OUT" "$ERR"
+              echo 255
               return 0
-
             fi
 
+            if [ ! -s "$OUT" ] || ! jq empty "$OUT" >/dev/null 2>&1; then
+              echo "WARNING: empty/invalid instance-list JSON; treating as zero instances" >&2
+              cat "$OUT" >&2
+              cat "$ERR" >&2
+              rm -f "$OUT" "$ERR"
+              echo 0
+              return 0
+            fi
 
-            echo "No A1 instance currently exists."
-
-            return 1
+            COUNT=$(jq '[.data[]? | select(.shape == "VM.Standard.A1.Flex" and ."lifecycle-state" != "TERMINATED" and ."lifecycle-state" != "TERMINATING")] | length' "$OUT")
+            rm -f "$OUT" "$ERR"
+            echo "${COUNT:-0}"
+            return 0
           }
 
-
-          # ============================================================
-          # GET AVAILABILITY DOMAINS
-          # ============================================================
-
-          get_availability_domains() {
-
-            echo ""
-            echo "Fetching availability domains..."
-
-
-            STDOUT_FILE=$(mktemp)
-            STDERR_FILE=$(mktemp)
-
+          list_ads() {
+            local OUT ERR CODE
+            OUT=$(mktemp)
+            ERR=$(mktemp)
 
             oci iam availability-domain list \
               --compartment-id "$COMPARTMENT" \
               --output json \
-              >"$STDOUT_FILE" \
-              2>"$STDERR_FILE"
+              >"$OUT" 2>"$ERR"
+            CODE=$?
 
-
-            OCI_STATUS=$?
-
-
-            if [ "$OCI_STATUS" -ne 0 ]; then
-
-              echo ""
-              echo "OCI availability-domain request failed."
-
-              echo ""
-              echo "STDOUT:"
-              cat "$STDOUT_FILE"
-
-              echo ""
-              echo "STDERR:"
-              cat "$STDERR_FILE"
-
-              rm -f "$STDOUT_FILE" "$STDERR_FILE"
-
-              return 1
-
+            if [ "$CODE" -ne 0 ] || [ ! -s "$OUT" ] || ! jq empty "$OUT" >/dev/null 2>&1; then
+              echo "Availability-domain query failed (exit $CODE)" >&2
+              cat "$OUT" >&2
+              cat "$ERR" >&2
+              rm -f "$OUT" "$ERR"
+              echo "[]"
+              return 0
             fi
 
-
-            if [ ! -s "$STDOUT_FILE" ]; then
-
-              echo "OCI returned no availability-domain data."
-
-              echo ""
-              echo "STDERR:"
-              cat "$STDERR_FILE"
-
-              rm -f "$STDOUT_FILE" "$STDERR_FILE"
-
-              return 1
-
-            fi
-
-
-            if ! jq empty "$STDOUT_FILE" >/dev/null 2>&1; then
-
-              echo "OCI returned invalid availability-domain JSON."
-
-              echo ""
-              echo "STDOUT:"
-              cat "$STDOUT_FILE"
-
-              rm -f "$STDOUT_FILE" "$STDERR_FILE"
-
-              return 1
-
-            fi
-
-
-            AD_JSON=$(jq -c '.data | map(.name)' "$STDOUT_FILE")
-
-            JQ_STATUS=$?
-
-
-            rm -f "$STDOUT_FILE" "$STDERR_FILE"
-
-
-            if [ "$JQ_STATUS" -ne 0 ]; then
-
-              echo "Could not parse availability domains."
-
-              return 1
-
-            fi
-
-
-            AD_COUNT=$(echo "$AD_JSON" | jq 'length')
-
-
-            if [ "$AD_COUNT" -eq 0 ]; then
-
-              echo "No availability domains returned."
-
-              return 1
-
-            fi
-
-
-            echo ""
-            echo "Found ${AD_COUNT} availability domain(s):"
-
-            echo "$AD_JSON" | jq -r '.[]'
-
-
+            jq -c '.data | map(.name)' "$OUT"
+            rm -f "$OUT" "$ERR"
             return 0
           }
 
-
-          # ============================================================
-          # LAUNCH INSTANCE
-          # ============================================================
-
           try_create_instance() {
+            local AD="$1" OUT ERR CODE
+            OUT=$(mktemp)
+            ERR=$(mktemp)
 
-            local AD="$1"
-
-
-            echo ""
-            echo "------------------------------------------------------"
-            echo "Attempting VM creation"
-            echo "Availability Domain: ${AD}"
-            echo "------------------------------------------------------"
-
-
-            STDOUT_FILE=$(mktemp)
-            STDERR_FILE=$(mktemp)
-
+            echo "Attempting VM creation in ${AD}..."
 
             oci compute instance launch \
               --availability-domain "$AD" \
@@ -613,210 +192,74 @@ jobs:
               --display-name "AlwaysFree-ARM-Server" \
               --ssh-authorized-keys-file instance_key.pub \
               --output json \
-              >"$STDOUT_FILE" \
-              2>"$STDERR_FILE"
+              >"$OUT" 2>"$ERR"
+            CODE=$?
 
-
-            OCI_STATUS=$?
-
-
-            if [ "$OCI_STATUS" -eq 0 ]; then
-
-              echo ""
+            if [ "$CODE" -eq 0 ]; then
               echo "======================================================"
-              echo "🎉 SUCCESS"
+              echo "SUCCESS — create request accepted in ${AD}"
               echo "======================================================"
-              echo "OCI accepted the VM creation request."
-              echo "Availability Domain: ${AD}"
-              echo ""
-
-              echo "OCI response:"
-              cat "$STDOUT_FILE"
-
-              echo "======================================================"
-
-
-              rm -f "$STDOUT_FILE" "$STDERR_FILE"
-
-
-              send_telegram \
-                "🎉 SUCCESS! Oracle Always Free VM request was accepted in ${AD}! The VM is now provisioning. 🚀"
-
-
+              cat "$OUT"
+              rm -f "$OUT" "$ERR"
+              send_telegram "SUCCESS: Oracle Always Free VM request accepted in ${AD}."
               return 0
-
             fi
 
-
-            echo ""
-            echo "VM creation failed in ${AD}."
-
-            echo ""
-            echo "OCI exit code:"
-            echo "$OCI_STATUS"
-
-            echo ""
-            echo "OCI STDOUT:"
-            cat "$STDOUT_FILE"
-
-            echo ""
-            echo "OCI STDERR:"
-            cat "$STDERR_FILE"
-
-
-            rm -f "$STDOUT_FILE" "$STDERR_FILE"
-
-
+            echo "VM creation failed in ${AD} (exit ${CODE})"
+            cat "$OUT"
+            cat "$ERR"
+            rm -f "$OUT" "$ERR"
             return 1
           }
 
-
-          # ============================================================
-          # MAIN LOOP
-          # ============================================================
-
           CHECK_NUMBER=0
-
-
           while true; do
-
             CHECK_NUMBER=$((CHECK_NUMBER + 1))
-
-
-            echo ""
             echo ""
             echo "======================================================"
-            echo "CHECK #${CHECK_NUMBER}"
-            echo "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "CHECK #${CHECK_NUMBER}  $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo "======================================================"
 
+            INSTANCE_COUNT=$(count_existing_a1)
+            echo "Existing non-terminated A1 instances: ${INSTANCE_COUNT}"
 
-            # ========================================================
-            # EXISTING INSTANCE
-            # ========================================================
+            if [ "$INSTANCE_COUNT" = "255" ]; then
+              echo "OCI query failed. Retrying in ${CHECK_INTERVAL}s..."
+              sleep "$CHECK_INTERVAL"
+              continue
+            fi
 
-            check_existing_instance
-
-            EXISTING_STATUS=$?
-
-
-            if [ "$EXISTING_STATUS" -eq 0 ]; then
-
-              echo ""
-              echo "======================================================"
+            if [ "$INSTANCE_COUNT" -gt 0 ]; then
               echo "A1 INSTANCE ALREADY EXISTS"
-              echo "======================================================"
-
               exit 0
-
             fi
 
+            AD_JSON=$(list_ads)
+            AD_COUNT=$(echo "$AD_JSON" | jq 'length')
 
-            # ========================================================
-            # OCI API ERROR
-            # ========================================================
-
-            if [ "$EXISTING_STATUS" -eq 2 ]; then
-
-              echo ""
-              echo "OCI API request failed."
-
-              echo "Retrying in ${CHECK_INTERVAL} seconds..."
-
+            if [ "${AD_COUNT:-0}" -eq 0 ]; then
+              echo "Could not retrieve availability domains. Retrying in ${CHECK_INTERVAL}s..."
               sleep "$CHECK_INTERVAL"
-
               continue
-
             fi
 
-
-            # ========================================================
-            # GET AVAILABILITY DOMAINS
-            # ========================================================
-
-            get_availability_domains
-
-            AD_STATUS=$?
-
-
-            if [ "$AD_STATUS" -ne 0 ]; then
-
-              echo ""
-              echo "Unable to retrieve availability domains."
-
-              echo "Retrying in ${CHECK_INTERVAL} seconds..."
-
-              sleep "$CHECK_INTERVAL"
-
-              continue
-
-            fi
-
+            echo "Availability domains:"
+            echo "$AD_JSON" | jq -r '.[]'
 
             SUCCESS=false
-
-
-            # ========================================================
-            # TRY ALL AVAILABILITY DOMAINS
-            # ========================================================
-
             while IFS= read -r AD; do
-
               AD=$(echo "$AD" | xargs)
-
-
-              if [ -z "$AD" ]; then
-                continue
-              fi
-
-
+              [ -z "$AD" ] && continue
               if try_create_instance "$AD"; then
-
                 SUCCESS=true
-
                 break
-
               fi
-
-
-              echo ""
-              echo "Moving to next availability domain..."
-
-            done < <(
-              echo "$AD_JSON" | jq -r '.[]'
-            )
-
-
-            # ========================================================
-            # SUCCESS
-            # ========================================================
+            done < <(echo "$AD_JSON" | jq -r '.[]')
 
             if [ "$SUCCESS" = true ]; then
-
-              echo ""
-              echo "======================================================"
-              echo "VM CREATION REQUEST ACCEPTED"
-              echo "======================================================"
-
               exit 0
-
             fi
 
-
-            # ========================================================
-            # RETRY
-            # ========================================================
-
-            echo ""
-            echo "======================================================"
-            echo "NO A1 CAPACITY FOUND"
-            echo "======================================================"
-
-            echo "Next check in ${CHECK_INTERVAL} seconds."
-
-            echo "======================================================"
-
-
+            echo "NO A1 CAPACITY FOUND. Next check in ${CHECK_INTERVAL}s."
             sleep "$CHECK_INTERVAL"
-
           done
