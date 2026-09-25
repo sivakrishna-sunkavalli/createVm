@@ -1,7 +1,7 @@
 name: Oracle Always Free A1 Provisioner
 
 on:
-  schedule:
+ # schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
